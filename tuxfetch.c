@@ -1,6 +1,7 @@
-//usr/bin/cc tuxfetch.c -lpthread -lpci -O3 -g3 -o tuxfetch; exec ./tuxfetch
+//usr/bin/cc tuxfetch.c -lpthread -Wpedantic -std=c11 -O3 -g3 -o tuxfetch; exec ./tuxfetch
 
 #define DIRENT_SIZE (100 * 1024 * 4)
+#define MAX_LENGTH 50
 
 // replace cpuid.h with this for tcc support
 int __get_cpuid(unsigned int leaf, unsigned int *a, unsigned int *b,
@@ -9,66 +10,45 @@ int __get_cpuid(unsigned int leaf, unsigned int *a, unsigned int *b,
   __asm__ __volatile__("cpuid\n\t"
                        : "=a"(*a), "=b"(*b), "=c"(*c), "=d"(*d)
                        : "0"(leaf));
-
   return 1;
 }
 
 //#include <cpuid.h>
-
 #include <ctype.h>
-
 #define _GNU_SOURCE
 #define _LARGEFILE64_SOURCE
 #define __USE_LARGEFILE64
 #include <dirent.h> // pacman package count and wm fetch
-
 #include <fcntl.h> // open
-
 #include <stdio.h> // printf
-
 #include <stdlib.h> // malloc
-
 #include <string.h>
-
 #include <syscall.h>
-
 #include <threads.h>
-//#include "tuxthread/tuxthread.h"
-
 #include <unistd.h> // read
-
 #include <linux/fb.h>
 #include <sys/ioctl.h> // fb0 resolution fetch
-
 #include <sys/mman.h> // mmap
-
 #include <sys/time.h> // benchmarking
-
 #include <sys/utsname.h> // kernel fetch
-
 #include <sys/stat.h> // get size of file
-
 #include <sys/sysinfo.h> // uptime fetch
-
-#include <pci/pci.h> // gpu fetch
-
-#define MAX_LENGTH 50
 
 #define TIME_INIT struct timeval start, end
 #define TIME_START gettimeofday(&start, NULL)
 #define TIME_END                                                               \
   gettimeofday(&end, NULL);                                                    \
-  printf("\e[90mtime %lu us\e[0m\n",                                           \
+  printf("\033[90mtime %lu us\033[0m\n",                                           \
          (end.tv_sec - start.tv_sec) * 1000000 + end.tv_usec - start.tv_usec)
 
-char tux[] = "\e[1m\n\
-\e[37m       ,--.   \n\
-\e[37m      |0\e[33m_\e[37m0 |\n\
-\e[37m      |\e[33mL_/\e[37m |\n\
-\e[37m     //   \\ \\  \n\
-\e[37m    ((     ) )    \n\
-\e[33m   /`\\     /`\\ \e[37m \n\
-\e[33m   \\__)\e[37m===\e[33m(__/\e[37m ";
+char tux[] = "\033[1m\n\
+\033[37m       ,--.   \n\
+\033[37m      |0\033[33m_\033[37m0 |\n\
+\033[37m      |\033[33mL_/\033[37m |\n\
+\033[37m     //   \\ \\  \n\
+\033[37m    ((     ) )    \n\
+\033[33m   /`\\     /`\\ \033[37m \n\
+\033[33m   \\__)\033[37m===\033[33m(__/\033[37m ";
 
 char *read_first_line(char *path) {
   int file = open(path, O_RDONLY);
@@ -97,24 +77,25 @@ char *read_file(char *path) {
   return buffer;
 }
 
-int ppid_from_pid(int pid) {
+pid_t ppid_from_pid(pid_t pid) {
   char path[256];
   snprintf(path, sizeof(path), "/proc/%d/stat", pid);
-  FILE *file = fopen(path, "r");
-  int ppid;
-  fscanf(file, "%*d %*s %*c %d", &ppid);
-  fclose(file);
+  char * buffer = read_file(path);
+  buffer = strrchr(buffer,')') + 2;
+  pid_t ppid;
+  sscanf(buffer, "%*c %d", &ppid);
   return ppid;
 }
 
-char *name_from_pid(int pid) {
+char *name_from_pid(pid_t pid) {
   char path[256];
   snprintf(path, sizeof(path), "/proc/%d/comm", pid);
   return read_first_line(path);
 }
 
 #define WM_COUNT 32
-static char wms[WM_COUNT][16] = {
+#define WM_NAME_LENGTH 16
+static char wms[WM_COUNT][WM_NAME_LENGTH] = {
     "9wm",      "awesome",      "blackbox",    "bspwm",
     "compiz",   "dwl",          "dwm",         "enlightenment",
     "evilwm",   "fluxbox",      "gnome-shell", "herbstluftwm",
@@ -124,51 +105,76 @@ static char wms[WM_COUNT][16] = {
     "spectrwm", "sowm",         "sway",        "twm",
     "waymonad", "weston",       "xfwm",        "xmonad"};
 
-int fetch_wm() {
-  int proc_dir = open("/proc/", O_RDONLY | O_DIRECTORY);
+void dir_foreach_dirent(int dir, int callback(int, struct dirent64 *)) {
   char *buffer = mmap(0, DIRENT_SIZE, PROT_READ | PROT_WRITE,
                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  int entries_length = syscall(SYS_getdents64, proc_dir, buffer, DIRENT_SIZE);
+  size_t entries_length = syscall(SYS_getdents64, dir, buffer, DIRENT_SIZE);
 
   for (int p = 0; p < entries_length;) {
     struct dirent64 *entry = (struct dirent64 *)(buffer + p);
     p += entry->d_reclen;
+    if (callback(dir, entry))
+      break;
+  }
+}
 
-    char stat[256];
-    char stat_path[256];
+int dir_sumby_dirent(int dir, int callback(int, struct dirent64 *)) {
+  int sum;
+  char *buffer = mmap(0, DIRENT_SIZE, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  size_t entries_length = syscall(SYS_getdents64, dir, buffer, DIRENT_SIZE);
 
-    if (isdigit(entry->d_name[0])) {
-      snprintf(stat_path, 256, "/proc/%s/stat", entry->d_name);
-      int name_fd = open(stat_path, O_RDONLY);
-      read(name_fd, stat, 256);
-      stat[255] = '\0';
-      close(name_fd);
+  for (int p = 0; p < entries_length;) {
+    struct dirent64 *entry = (struct dirent64 *)(buffer + p);
+    p += entry->d_reclen;
+    sum += callback(dir, entry);
+  }
+  return sum;
+}
 
-      // find name in parens or continue
-      char *name = strchr(stat, '(') + 1;
-      char *end = strchr(name, ')');
-      if (end) {
-        *end = '\0';
-      } else {
-        continue;
-      }
+int dirent_isdir(int dir, struct dirent64 * entry){
+	return entry->d_type == DT_DIR;
+}
 
-      for (int i = 0; i < WM_COUNT; i++) {
-        if (!strcmp(wms[i], name)) {
-          printf("\e[18C%13s%s\n", "WM: ", name);
-          break;
-        }
+int dir_count_subdirs(int dir){
+	return dir_sumby_dirent(dir,dirent_isdir);
+}
+
+void path_foreach_dirent(char *path, int callback(int, struct dirent64 *)) {
+  int dir = open(path, O_RDONLY | O_DIRECTORY);
+  dir_foreach_dirent(dir, callback);
+  close(dir);
+}
+
+int print_if_wm(int proc_dir, struct dirent64 *entry) {
+  // check if process directory (dir name is a number)
+  if (isdigit(entry->d_name[0])) {
+    int process_dir = openat(proc_dir, entry->d_name, O_RDONLY | O_DIRECTORY);
+    int comm_file = openat(process_dir, "comm", O_RDONLY);
+    close(process_dir);
+    char proc_name[WM_NAME_LENGTH];
+    int length = read(comm_file, proc_name, WM_NAME_LENGTH);
+    close(comm_file);
+    // remove trailing newline
+    proc_name[length - 1] = '\0';
+    for (int j = 0; j < WM_COUNT; j++) {
+      if (!strcmp(wms[j], proc_name)) {
+        printf("\033[18C%13s%s\n", "WM: ", proc_name);
+        return 1;
       }
     }
   }
-  close(proc_dir);
+  return 0;
+}
 
+int fetch_wm() {
+  path_foreach_dirent("/proc/", print_if_wm);
   return 0;
 }
 
 int fetch_hostname() {
 
-  printf("\e[18C%13s%s\n",
+  printf("\033[18C%13s%s\n",
          "host: ", read_first_line("/proc/sys/kernel/hostname"));
 
   return 0;
@@ -177,7 +183,7 @@ int fetch_hostname() {
 int fetch_terminal() {
   char *terminal = name_from_pid(ppid_from_pid(getppid()));
 
-  printf("\e[18C%13s%s (%s)\n", "terminal: ", terminal, getenv("TERM"));
+  printf("\033[18C%13s%s (%s)\n", "terminal: ", terminal, getenv("TERM"));
 
   return 0;
 }
@@ -186,7 +192,7 @@ int fetch_model() {
   char *name = read_first_line("/sys/class/dmi/id/product_name");
   char *version = read_first_line("/sys/class/dmi/id/product_version");
 
-  printf("\e[18C%13s%s %s\n", "model: ", name, version);
+  printf("\033[18C%13s%s %s\n", "model: ", name, version);
 
   return 0;
 }
@@ -195,7 +201,7 @@ int fetch_kernel() {
   struct utsname uname_info;
   uname(&uname_info);
 
-  printf("\e[18C%13s%s\n", "kernel: ", uname_info.release);
+  printf("\033[18C%13s%s\n", "kernel: ", uname_info.release);
 
   return 0;
 }
@@ -205,64 +211,64 @@ int fetch_os(char *buffer) {
   static char name[MAX_LENGTH];
   sscanf(id, "NAME=\"%[^\"]+", name);
 
-  printf("\e[18C%13s%s\n", "OS: ", name);
+  printf("\033[18C%13s%s\n", "OS: ", name);
 
   return 0;
 }
 
-char alpine_logo[] = "\e[1m\n\
-\e[31m   .8BBBBBBBBB.  \n\
-\e[33m  .888888888888. \n\
-\e[32m .8888* *88*8888.\n\
-\e[36m 888* ,8, `. *888\n\
-\e[36m `* ,88888, `, *`\n\
-\e[34m  `888888888888` \n\
-\e[35m   `8BBBBBBBBB`   ";
+char alpine_logo[] = "\033[1m\n\
+\033[31m   .8BBBBBBBBB.  \n\
+\033[33m  .888888888888. \n\
+\033[32m .8888* *88*8888.\n\
+\033[36m 888* ,8, `. *888\n\
+\033[36m `* ,88888, `, *`\n\
+\033[34m  `888888888888` \n\
+\033[35m   `8BBBBBBBBB`   ";
 
-char arch_logo[] = "\e[1m\n\
-\e[31m        A \n\
-\e[31m       a8s \n\
-\e[33m      ao88s \n\
-\e[32m     a88888s \n\
-\e[36m    a88Y*Y88s \n\
-\e[34m   a88H   B8bs \n\
-\e[35m  /*`       `*\\ ";
+char arch_logo[] = "\033[1m\n\
+\033[31m        A \n\
+\033[31m       a8s \n\
+\033[33m      ao88s \n\
+\033[32m     a88888s \n\
+\033[36m    a88Y*Y88s \n\
+\033[34m   a88H   B8bs \n\
+\033[35m  /*`       `*\\ ";
 
-char celos_logo[] = "\e[1m\n\
-\e[35m    _~a8B6s~_   \n\
-\e[35m  .88888`  `Y6, \n\
-\e[35m  J8888:     8l \n\
-\e[35m  B88888,  .d88 \n\
-\e[35m  V8P* `Y88888P \n\
-\e[35m  `9b, .d88888` \n\
-\e[35m    `~9BBB8~`   ";
+char celos_logo[] = "\033[1m\n\
+\033[35m    _~a8B6s~_   \n\
+\033[35m  .88888`  `Y6, \n\
+\033[35m  J8888:     8l \n\
+\033[35m  B88888,  .d88 \n\
+\033[35m  V8P* `Y88888P \n\
+\033[35m  `9b, .d88888` \n\
+\033[35m    `~9BBB8~`   ";
 
-char debian_logo[] = "\e[1m\n\
-\e[31m    ,gA88bq.  \n\
-\e[33m   dP      `9.\n\
-\e[32m  d7  ,*`.  )8\n\
-\e[36m  9:  A    ,Q*\n\
-\e[34m  *1  `^vsv\" \n\
-\e[35m   *b         \n\
-\e[35m     \"~. ";
+char debian_logo[] = "\033[1m\n\
+\033[31m    ,gA88bq.  \n\
+\033[33m   dP      `9.\n\
+\033[32m  d7  ,*`.  )8\n\
+\033[36m  9:  A    ,Q*\n\
+\033[34m  *1  `^vsv\" \n\
+\033[35m   *b         \n\
+\033[35m     \"~. ";
 
-char mint_logo[] = "\e[1m\n\
-\e[32m BBBBBBBBBBBs~. \n\
-\e[32m BB8  88**88**8,\n\
-\e[32m   H  H  a  a  l\n\
-\e[32m   H  H  H  H  H\n\
-\e[32m   V, *88888* .H\n\
-\e[32m   `8,_______.=H\n\
-\e[32m     *YBBBBBBBBH ";
+char mint_logo[] = "\033[1m\n\
+\033[32m BBBBBBBBBBBs~. \n\
+\033[32m BB8  88**88**8,\n\
+\033[32m   H  H  a  a  l\n\
+\033[32m   H  H  H  H  H\n\
+\033[32m   V, *88888* .H\n\
+\033[32m   `8,_______.=H\n\
+\033[32m     *YBBBBBBBBH ";
 
-char ubuntu_logo[] = "\e[1m\n\
-\e[31m          \e[35m($)\n\
-\e[31m    \e[33m .\e[31m s88~..\n\
-\e[31m    \e[33m.8*  \e[31m `*9.\n\
-\e[31m \e[31m($) \e[33m8\n\
-\e[31m    \e[33m`6-  \e[35m _-8`\n\
-\e[31m     \e[33m`\e[35m ^88*``\n\
-\e[31m          \e[33m($) ";
+char ubuntu_logo[] = "\033[1m\n\
+\033[31m          \033[35m($)\n\
+\033[31m    \033[33m .\033[31m s88~..\n\
+\033[31m    \033[33m.8*  \033[31m `*9.\n\
+\033[31m \033[31m($) \033[33m8\n\
+\033[31m    \033[33m`6-  \033[35m _-8`\n\
+\033[31m     \033[33m`\033[35m ^88*``\n\
+\033[31m          \033[33m($) ";
 
 int fetch_art(char *buffer) {
   char *id = strstr(buffer, "\nID=");
@@ -293,7 +299,7 @@ int fetch_art(char *buffer) {
 
     write(1, ubuntu_logo, sizeof(ubuntu_logo));
   }
-  
+
   return 0;
 }
 
@@ -305,7 +311,7 @@ int fetch_uptime() {
   unsigned long hour = 60 * minute;
   unsigned long day = 24 * hour;
 
-  printf("\e[18C%13s%lu%c %lu%c %lu%c\n", "uptime: ", seconds / day, 'd',
+  printf("\033[18C%13s%lu%c %lu%c %lu%c\n", "uptime: ", seconds / day, 'd',
          (seconds % day) / hour, 'h', (seconds % hour) / minute, 'm');
 
   return 0;
@@ -408,7 +414,7 @@ int fetch_packages() {
 
   int flatpaks = 0;
 
-  if (flatpak_app_dir && flatpak_runtime_dir) {
+  if (flatpak_app_dir != -1 && flatpak_runtime_dir != -1) {
 
     int entries_length;
 
@@ -431,7 +437,7 @@ int fetch_packages() {
     close(flatpak_runtime_dir);
   }
 
-  printf("\e[18C%13s%d (%s) %d (flatpak)\n", "packages: ", packages,
+  printf("\033[18C%13s%d (%s) %d (flatpak)\n", "packages: ", packages,
          package_manager, flatpaks);
 
   return 0;
@@ -439,12 +445,12 @@ int fetch_packages() {
 
 int fetch_env() {
 
-  printf("\e[18C%13s%s\n", "shell: ", getenv("SHELL"));
-  printf("\e[18C%13s%s\n", "username: ", getenv("USER"));
+  printf("\033[18C%13s%s\n", "shell: ", getenv("SHELL"));
+  printf("\033[18C%13s%s\n", "username: ", getenv("USER"));
   char *desktop = getenv("XDG_CURRENT_DESKTOP");
   if (!desktop)
     desktop = "none";
-  printf("\e[18C%13s%s\n", "DE: ", desktop);
+  printf("\033[18C%13s%s\n", "DE: ", desktop);
 
   return 0;
 }
@@ -466,7 +472,7 @@ int fetch_cpu() {
     }
   }
 
-  printf("\e[18C%13s%s (%ld)\n", "CPU: ", cpu, sysconf(_SC_NPROCESSORS_CONF));
+  printf("\033[18C%13s%s (%ld)\n", "CPU: ", cpu, sysconf(_SC_NPROCESSORS_CONF));
   return 0;
 }
 #else
@@ -476,7 +482,7 @@ int fetch_cpu() {
   char cpu[MAX_LENGTH];
   sscanf(line, "model name	: %[^\n]", cpu);
 
-  printf("\e[18C%13s%s (%ld)\n", "CPU: ", cpu, sysconf(_SC_NPROCESSORS_CONF));
+  printf("\033[18C%13s%s (%ld)\n", "CPU: ", cpu, sysconf(_SC_NPROCESSORS_CONF));
   return 0;
 }
 #endif
@@ -488,89 +494,76 @@ int fetch_resolution() {
   if (fb_fd != -1) {
     struct fb_var_screeninfo vinfo;
     ioctl(fb_fd, FBIOGET_VSCREENINFO, &vinfo);
-    printf("\e[18C%13s%dx%d\n", "resolution: ", vinfo.xres, vinfo.yres);
+    printf("\033[18C%13s%dx%d\n", "resolution: ", vinfo.xres, vinfo.yres);
     close(fb_fd);
   } else {
     int width, height;
     char *modes = read_first_line("/sys/class/graphics/fb0/virtual_size");
     sscanf(modes, "%d,%d", &width, &height);
-    printf("\e[18C%13s%dx%d\n", "resolution: ", width, height);
+    printf("\033[18C%13s%dx%d\n", "resolution: ", width, height);
   }
 
   return 0;
 }
 
-// pull request to add your own gpu
-// https://raw.githubusercontent.com/pciutils/pciutils/master/pci.ids
-#define GPU_COUNT 5
-static struct {
-  int key;
-  char value[16];
-} gpus[GPU_COUNT] = {{5686, "Renoir"},
-                     {5592, "Picasso"},
-                     {0x1b83, "GTX 1060 6GB"},
-                     {0x1b84, "GTX 1060 3GB"},
-                     {4487, "GTX 760"}};
+struct keyval {unsigned int key;const char * value;};
+
+#include "gpu-database.h"
+
+int compare_keyval(const void * a, const void * b) {
+   return ((struct keyval*)a)->key - ((struct keyval*)b)->key;
+}
 
 int fetch_gpu() {
+  char *vendorstring = read_first_line("/sys/class/drm/card0/device/vendor");
+  char *devicestring = read_first_line("/sys/class/drm/card0/device/device");
+  unsigned int vendorn, devicen;
+  sscanf(vendorstring, "%x", &vendorn);
+  sscanf(devicestring, "%x", &devicen);
 
-  char buffer[MAX_LENGTH];
+  char *vendor = "unknown vendor";
+  struct keyval * gpus = NULL;
+  size_t gpu_count = 0;
 
-  struct pci_access *pacc = pci_alloc();
-
-  pci_init(pacc);
-  pci_scan_bus(pacc);
-  struct pci_dev *dev = pacc->devices;
-
-  while (dev) {
-    pci_fill_info(dev, PCI_FILL_IDENT | PCI_FILL_CLASS);
-    if (dev->device_class == 768) {
-      break;
-    }
-    dev = dev->next;
+  switch (vendorn) {
+  case 0x1002:
+    vendor = "AMD";
+	gpus = amd_gpus;
+	gpu_count = AMD_GPU_COUNT;
+    break;
+  case 0x10de:
+    vendor = "NVIDIA";
+	gpus = nv_gpus;
+	gpu_count = NV_GPU_COUNT;
+    break;
+  case 0x8086:
+    vendor = "Intel";
+	gpus = intel_gpus;
+	gpu_count = INTEL_GPU_COUNT;
+    break;
   }
-  if (!dev) {
-    printf("\e[18C%13s%s\n", "GPU: ", "none");
+
+  struct keyval device_key = {devicen,NULL};
+  struct keyval * device_keyval = bsearch(
+	  &device_key,
+	  gpus,
+	  gpu_count,
+	  sizeof(struct keyval),
+	  compare_keyval
+  );
+
+  if (device_keyval!=NULL){
+    printf("\033[18C%13s%s %s\n", "GPU: ", vendor, device_keyval->value);
     return 0;
   }
 
-  char *vendor = "unknown vendor";
-
-  switch (dev->vendor_id) {
-  case 4098:
-    vendor = "AMD";
-    break;
-  case 4318:
-    vendor = "NVIDIA";
-    break;
-  case 32902:
-    vendor = "Intel";
-    break;
-  }
-
-  char *model;
-
-  for (int i = 0; i < GPU_COUNT; i++) {
-    if (gpus[i].key == dev->device_id) {
-      model = gpus[i].value;
-      printf("\e[18C%13s%s %s\n", "GPU: ", vendor, model);
-      return 0;
-    }
-  }
-
-  model = pci_lookup_name(pacc, buffer, sizeof(buffer), PCI_LOOKUP_DEVICE,
-                          dev->vendor_id, dev->device_id);
-
-  printf("\e[18C%13s%s %s (id: %d)\n", "GPU: ", vendor, model, dev->device_id);
-
-  pci_cleanup(pacc);
-
+  printf("\033[18C%13s%s (id: %x)\n", "GPU: ", vendor, devicen);
   return 0;
 }
 
 int fetch_memory() {
   unsigned long memory = sysconf(_SC_PHYS_PAGES) * sysconf(_SC_PAGESIZE);
-  printf("\e[18C%13s%luMiB\n", "memory: ", memory / 1024 / 1024);
+  printf("\033[18C%13s%luMiB\n", "memory: ", memory / 1024 / 1024);
   return 0;
 }
 
@@ -585,11 +578,11 @@ int main() {
   fetch_art(release);
   printf("\n");
   printf("%s\n", tux);
-  printf("%s", "\e[16A");
+  printf("%s", "\033[16A");
 
   // create threads for the slowest tasks
-  thrd_t gpu_thread;
-  thrd_create(&gpu_thread, fetch_gpu, NULL);
+  // thrd_t gpu_thread;
+  // thrd_create(&gpu_thread, fetch_gpu, NULL);
 
   thrd_t packages_thread;
   thrd_create(&packages_thread, fetch_packages, NULL);
@@ -607,20 +600,21 @@ int main() {
   fetch_memory();
   fetch_env();
   fetch_cpu();
+  fetch_gpu();
   fetch_resolution();
 
   // wait for threads to end
-  int gpu_result;
+  // int gpu_result;
   int packages_result;
   int wm_result;
-  thrd_join(gpu_thread, &gpu_result);
+  // thrd_join(gpu_thread, &gpu_result);
   thrd_join(packages_thread, &packages_result);
   thrd_join(wm_thread, &wm_result);
 
   printf("\n");
-  printf("\e[18C%13s%s\n", "palette: ",
-         "\e[1m\e[100m  \e[101m  \e[102m  \e[103m  \e[104m  \e[105m  \e[106m  "
-         "\e[107m  \e[0m");
+  printf("\033[18C%13s%s\n", "palette: ",
+         "\033[0m\033[100m\033[30m▀▀\033[101m\033[31m▀▀\033[102m\033[32m▀▀\033[103m\033[33m▀▀\033["
+         "104m\033[34m▀▀\033[105m\033[35m▀▀\033[106m\033[36m▀▀\033[107m\033[37m▀▀\033[0m");
   TIME_END;
 
   return 0;
