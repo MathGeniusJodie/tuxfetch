@@ -1,7 +1,9 @@
-//usr/bin/clang tuxfetch.c -lpthread -Wpedantic -std=c11 -O3 -g3 -o tuxfetch; exec ./tuxfetch
+//usr/bin/gcc tuxfetch.c -lpthread -fstack-usage -Wpedantic -std=c11 -O3 -g3 -o tuxfetch; exec ./tuxfetch
 
 #define MAX_LENGTH 50
 
+
+#ifdef __x86_64__
 // replace cpuid.h with this for tcc support
 int __get_cpuid(unsigned int leaf, unsigned int *a, unsigned int *b,
                 unsigned int *c, unsigned int *d) {
@@ -11,6 +13,7 @@ int __get_cpuid(unsigned int leaf, unsigned int *a, unsigned int *b,
 	                     : "0"(leaf));
 	return 1;
 }
+#endif
 
 //#include <cpuid.h>
 #include <ctype.h>
@@ -75,7 +78,7 @@ char *read_file(char *path) {
 }
 
 pid_t ppid_from_pid(pid_t pid) {
-	char path[PATH_MAX];
+	static char path[PATH_MAX];
 	snprintf(path, PATH_MAX, "/proc/%d/stat", pid);
 	char *buffer = read_file(path);
 	buffer = strrchr(buffer, ')') + 2;
@@ -85,7 +88,7 @@ pid_t ppid_from_pid(pid_t pid) {
 }
 
 char *name_from_pid(pid_t pid) {
-	char path[PATH_MAX];
+	static char path[PATH_MAX];
 	char *name = malloc(MAX_LENGTH);
 	snprintf(path, PATH_MAX, "/proc/%d/comm", pid);
 	read_first_line(path, name, MAX_LENGTH);
@@ -139,7 +142,7 @@ static char wms[WM_COUNT][WM_NAME_LENGTH] = {"9wm",
 bool dir_find(int dir, bool callback(int, struct dirent64 *, void *),
               void *userdata) {
 	int sum = 0;
-	size_t dirent_size = offsetof(struct dirent64, d_name) + NAME_MAX + 1;
+	const size_t dirent_size = offsetof(struct dirent64, d_name) + NAME_MAX + 1;
 	char buffer[dirent_size];
 
 	while (true) {
@@ -161,7 +164,7 @@ bool dir_find(int dir, bool callback(int, struct dirent64 *, void *),
 int dir_sumby(int dir, int callback(int, struct dirent64 *, void *),
               void *userdata) {
 	int sum = 0;
-	size_t dirent_size = offsetof(struct dirent64, d_name) + NAME_MAX + 1;
+	const size_t dirent_size = offsetof(struct dirent64, d_name) + NAME_MAX + 1;
 	char buffer[dirent_size];
 
 	while (true) {
@@ -192,7 +195,7 @@ bool path_find(char *path, bool callback(int, struct dirent64 *, void *),
 	return ret;
 }
 
-int path_sumby(char *path, int callback(int, struct dirent64 *, void *),
+__attribute__ ((noinline)) int path_sumby(char *path, int callback(int, struct dirent64 *, void *),
                void *userdata) {
 	int dir = open(path, O_RDONLY | O_DIRECTORY);
 	if (dir == -1)
@@ -447,11 +450,22 @@ int fetch_cpu() {
 }
 #else
 int fetch_cpu() {
+	char *modelname = "unknown";
 	char *buffer = read_file("/proc/cpuinfo");
-	char *line = strstr(buffer, "model name	: ");
-	char cpu[MAX_LENGTH];
-	sscanf(line, "model name	: %[^\n]", cpu);
-	printf("\033[18C%13s%s (%ld)\n", "CPU: ", cpu,
+	if(buffer){
+		char *line = strstr(buffer, "model name");
+		// for power cpus
+		if(line==NULL){
+			line = strstr(buffer, "cpu");
+		}
+		if(line!=NULL){
+			modelname = strchr(line,':');
+			modelname += 2;
+			char *newline = strchr(modelname,'\n');
+			newline[0] = '\0';
+		}
+	}
+	printf("\033[18C%13s%s (%ld)\n", "CPU: ", modelname,
 	       sysconf(_SC_NPROCESSORS_CONF));
 	return 0;
 }
@@ -549,7 +563,8 @@ int main() {
 	printf("\n");
 	printf("%s\n", tux);
 	printf("%s", "\033[16A");
-
+	
+	// run slow tasks in their own thread
 	thrd_t packages_thread;
 	thrd_create(&packages_thread, fetch_packages, NULL);
 
